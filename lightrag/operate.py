@@ -1468,13 +1468,13 @@ async def _get_node_data(
         if n is not None
     ]  # what is this text_chunks_db doing.  dont remember it in airvx.  check the diagram.
     # get entitytext chunk
-    use_text_units = await _find_most_related_text_unit_from_entities(
+    use_text_units = await _find_most_related_text_unit_from_entities_2hop(
         node_datas,
         query_param,
         text_chunks_db,
         knowledge_graph_inst,
     )
-    use_relations = await _find_most_related_edges_from_entities(
+    use_relations = await _find_most_related_edges_from_entities_2hop(
         node_datas,
         query_param,
         knowledge_graph_inst,
@@ -1680,6 +1680,57 @@ async def _find_most_related_text_unit_from_entities(
     return all_text_units
 
 
+async def _find_most_related_edges_from_entities_2hop(
+    node_datas: list[dict],
+    query_param: QueryParam,
+    knowledge_graph_inst: BaseGraphStorage,
+) -> list[dict]:
+    """Find most related edges from entities, going 2 hops away in the graph.
+
+    Args:
+        node_datas: List of entity data dictionaries
+        query_param: Query parameters
+        knowledge_graph_inst: Knowledge graph storage interface
+
+    Returns:
+        List of edge dictionaries
+    """
+    entity_ids = [n["entity_id"] for n in node_datas]
+    seen_edge_keys: set[tuple[str, str]] = set()
+    all_edges = []
+
+    # First hop: get directly related edges
+    direct_edges = await knowledge_graph_inst.get_edges_connected_to_nodes(entity_ids)
+    for edge in direct_edges:
+        edge_key = (edge["src_id"], edge["tgt_id"])
+        if edge_key not in seen_edge_keys:
+            all_edges.append(edge)
+            seen_edge_keys.add(edge_key)
+
+    # Second hop: get neighbor entity IDs
+    neighbor_ids = set()
+    for edge in direct_edges:
+        if edge["src_id"] in entity_ids:
+            neighbor_ids.add(edge["tgt_id"])
+        else:
+            neighbor_ids.add(edge["src_id"])
+
+    # Get edges connected to neighbor entities
+    neighbor_edges = await knowledge_graph_inst.get_edges_connected_to_nodes(
+        list(neighbor_ids)
+    )
+    for edge in neighbor_edges:
+        edge_key = (edge["src_id"], edge["tgt_id"])
+        if edge_key not in seen_edge_keys:
+            all_edges.append(edge)
+            seen_edge_keys.add(edge_key)
+
+    # Return sorted by relevance or timestamp
+    return sorted(all_edges, key=lambda x: x.get("weight", 0.0), reverse=True)[
+        : query_param.top_k_edges
+    ]
+
+
 async def _find_most_related_edges_from_entities(
     node_datas: list[dict],
     query_param: QueryParam,
@@ -1739,6 +1790,69 @@ async def _find_most_related_edges_from_entities(
     )
 
     return all_edges_data
+
+
+async def _find_most_related_text_unit_from_entities_2hop(
+    node_datas: list[dict],
+    query_param: QueryParam,
+    text_chunks_db: BaseKVStorage,
+    knowledge_graph_inst: BaseGraphStorage,
+) -> list[dict[str, Any]]:
+    """Find text units related to entities, going 2 hops away in the graph.
+
+    Args:
+        node_datas: List of entity data dictionaries
+        query_param: Query parameters
+        text_chunks_db: Text chunks database
+        knowledge_graph_inst: Knowledge graph storage interface
+
+    Returns:
+        List of text unit dictionaries
+    """
+    entity_ids = [n["entity_id"] for n in node_datas]
+    text_units = []
+    source_ids_set: set[str] = set()
+
+    # First hop: collect source IDs from direct entities
+    for n in node_datas:
+        if n.get("source_id"):
+            source_ids = split_string_by_multi_markers(
+                n["source_id"], [GRAPH_FIELD_SEP]
+            )
+            for source_id in source_ids:
+                source_ids_set.add(source_id)
+
+    # Second hop: get related entities and their source IDs
+    direct_edges = await knowledge_graph_inst.get_edges_connected_to_nodes(entity_ids)
+    neighbor_ids = set()
+    for edge in direct_edges:
+        if edge["src_id"] in entity_ids:
+            neighbor_ids.add(edge["tgt_id"])
+        else:
+            neighbor_ids.add(edge["src_id"])
+
+    # Get nodes for neighbors
+    neighbor_nodes = await knowledge_graph_inst.get_nodes_batch(list(neighbor_ids))
+    for node_id, node in neighbor_nodes.items():
+        if node and node.get("source_id"):
+            source_ids = split_string_by_multi_markers(
+                node["source_id"], [GRAPH_FIELD_SEP]
+            )
+            for source_id in source_ids:
+                source_ids_set.add(source_id)
+
+    # Fetch text units
+    source_ids_list = list(source_ids_set)
+    if source_ids_list:
+        text_units = await text_chunks_db.get_by_ids(source_ids_list)
+        text_units = [t for t in text_units if t is not None]
+
+    # Filter and sort by relevance
+    valid_text_units = [
+        t for t in text_units if "content" in t and t["content"] is not None
+    ]
+
+    return valid_text_units[: query_param.top_k_text_units]
 
 
 async def _get_edge_data(
